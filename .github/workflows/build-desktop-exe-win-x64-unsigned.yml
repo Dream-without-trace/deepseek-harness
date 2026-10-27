@@ -1,0 +1,291 @@
+# Build the unsigned Windows x64 desktop installer (NSIS .exe) for local use.
+#
+# The desktop packaging script (apps/desktop/scripts/package-target.ts) refuses
+# to build win-x64 off a Windows x64 host, so no existing workflow produces this
+# artifact: release.yml/ci*.yml run on Linux for npm packing, and
+# ci-master.yml's "windows" job only runs Wine-based node tests. This workflow is
+# a manual, credential-free build: --unsigned packaging needs no signing
+# hardware and no secrets; the runner's Visual Studio C++ Build Tools compile
+# the native NSIS installer helper in beforeBuild.
+name: Build desktop exe (win-x64 unsigned)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PRIMARY_NODE_VERSION: '24'
+  DSH_TELEMETRY_DISABLED: '1'
+
+jobs:
+  build:
+    name: unsigned win-x64 NSIS installer
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          clean: true
+
+      - uses: pnpm/action-setup@v4
+        with:
+          dest: ${{ runner.temp }}/setup-pnpm-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.PRIMARY_NODE_VERSION }}
+          package-manager-cache: false
+
+      # pwsh (not bash): a bash step puts Git-for-Windows' usr\bin first on PATH,
+      # which shadows the native System32 bsdtar with MSYS GNU tar. The release
+      # scripts call `tar -tzf/-xOzf <absolute windows path>`, and MSYS tar
+      # misparses the drive letter as a remote host ("Cannot connect to D").
+      - name: Configure pnpm store path
+        id: pnpm-store
+        shell: pwsh
+        run: |
+          $storeRoot = Join-Path $env:USERPROFILE '.local\share\pnpm\store'
+          $env:PNPM_CONFIG_STORE_DIR = $storeRoot
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "PNPM_CONFIG_STORE_DIR=$storeRoot"
+          $storePath = @((& pnpm store path --silent 2>$null) | Where-Object { $_ -ne '' } | Select-Object -Last 1).Trim()
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "path=$storePath"
+
+      - uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: windows-latest-node-${{ env.PRIMARY_NODE_VERSION }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            windows-latest-node-${{ env.PRIMARY_NODE_VERSION }}-pnpm-
+
+      - name: Install (immutable)
+        shell: pwsh
+        run: pnpm install --frozen-lockfile
+
+      # The 0.1.7 packaging script imports (transitively, via
+      # macos-notarization-proxy.ts) @deepseek-ai/node-addon-system/lib/flock.js,
+      # a TypeScript build artifact of the native/system workspace. Upstream builds
+      # it before desktop packaging (release.yml runs `pnpm --dir native/system run
+      # build:ts`); without this step the win-x64 package dies at import time with
+      # ERR_MODULE_NOT_FOUND on a clean checkout.
+      - name: Build native system (TypeScript)
+        shell: pwsh
+        run: pnpm --dir native/system run build:ts
+
+      # Fail fast (~1 min) if the bundled LibreOffice engine cannot convert on
+      # this runner image, before the ~15 min packaging step. The packaged
+      # runtime smoke exercises the same native win32 engine; a runner-level
+      # engine failure (fonts/profile context) there surfaced as the opaque
+      # "Unknown LibreOfficeKit exception". A direct CLI probe against the repo's
+      # committed sample docx reproduces it in plain Node, and the diagnostics
+      # below name the suspect on every image change.
+      - name: Probe LibreOffice engine on runner
+        shell: pwsh
+        run: |
+          $probeDir = Join-Path $env:RUNNER_TEMP 'lo-probe'
+          New-Item -ItemType Directory -Force $probeDir | Out-Null
+          $kitDir = Get-ChildItem (Join-Path $env:GITHUB_WORKSPACE 'node_modules\.pnpm') -Directory -Filter '@deepseek-ai+libreoffice-kit@*' |
+            Sort-Object Name -Descending | Select-Object -First 1
+          if ($kitDir -eq $null) { throw 'lo-probe: libreoffice-kit not found in pnpm store' }
+          $cli = Join-Path $kitDir.FullName 'node_modules\@deepseek-ai\libreoffice-kit\lib\cli.js'
+          $sample = Join-Path $env:GITHUB_WORKSPACE 'packages\bundle\web-app\tests\fixtures\document-conversion.docx'
+          $out = Join-Path $probeDir 'probe.pdf'
+          $result = & node $cli convert --input $sample --output $out 2>&1 | Out-String
+          "lo-probe result: $result"
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $out)) {
+            "=== lo-probe diagnostics ==="
+            "whoami: $(whoami)"
+            "USERPROFILE: $env:USERPROFILE"
+            "TEMP: $env:TEMP"
+            "PATH head: $($env:PATH.Split(';')[0..5] -join ' | ')"
+            "fonts: $((Get-ChildItem 'C:\Windows\Fonts' -Include '*.ttf','*.otf' -ErrorAction SilentlyContinue | Measure-Object).Count) ttf/otf files"
+            "defender: $((Get-Service WinDefend -ErrorAction SilentlyContinue).Status)"
+            "kit engine: $(Get-ChildItem (Join-Path $kitDir.FullName 'node_modules\@deepseek-ai') -Directory -Filter 'libreoffice-kit-*' | Select-Object -ExpandProperty Name -Join ', ')"
+            exit 1
+          }
+          "lo-probe: PDF produced $((Get-Item $out).Length) bytes"
+
+      # The packaging script reads release settings from this local file and
+      # never falls back to ambient values; unsigned packaging only needs the
+      # app id and the mandatory-update origins.
+      #
+      # DSH_DESKTOP_AUTO_UPDATE_ENV MUST be "production" for personal/fork
+      # builds: the "test" deployment bakes a mandatory-update policy with
+      # authentication "feishu-test" into app.asar, and on launch the shell
+      # opens a blocking modal ("登录测试环境") that blurs and freezes the
+      # main window until Feishu SSO succeeds — which a local unsigned build
+      # can never do. "production" is anonymous, so no dialog appears.
+      #
+      # Update channel (this fork): DSH_DESKTOP_UNSIGNED_UPDATE_FEED=1 bakes the
+      # generic electron-updater feed into unsigned builds, DOWNLOAD_PROD_ORIGIN
+      # overrides the fixed production feed origin, and the mandatory policy
+      # origin points at the same Qiniu CDN host, which serves the static
+      # api/v0/check_client_update object (200, no force) — never a 401, so the
+      # test-auth Feishu login flow stays dormant.
+      - name: Local unsigned release settings
+        shell: pwsh
+        env:
+          CDN_HOST: ${{ secrets.CDN_HOST }}
+        run: |
+          # Tolerate an accidental scheme prefix / trailing slash in the CDN_HOST secret.
+          $cdn = $env:CDN_HOST.Trim()
+          while ($cdn -match '^[a-zA-Z][a-zA-Z0-9+.-]*://') { $cdn = ($cdn -replace '^[a-zA-Z][a-zA-Z0-9+.-]*://', '').Trim() }
+          $cdn = $cdn.TrimEnd('/').Trim()
+          $settings = @(
+            'DSH_DESKTOP_APP_ID=com.deepseek.harness',
+            'DSH_DESKTOP_AUTO_UPDATE_ENV=production',
+            'DSH_DESKTOP_UNSIGNED_UPDATE_FEED=1',
+            "DOWNLOAD_PROD_ORIGIN=https://${cdn}",
+            'DSH_DESKTOP_MANDATORY_UPDATE_TEST_ORIGIN=https://harness-test.deepseek.com',
+            "DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN=https://${cdn}"
+          )
+          Set-Content -LiteralPath 'apps/desktop/.env.windows' -Value $settings -Encoding utf8
+          Write-Host '--- .env.windows (contains origins only, no secrets) ---'
+          Get-Content 'apps/desktop/.env.windows'
+
+      - name: Package unsigned Windows installer
+        shell: pwsh
+        continue-on-error: true
+        run: pnpm run package:desktop:win:x64:unsigned
+
+      # Temporary diagnostics for the 0.1.7 packaged-smoke LibreOffice failure:
+      # the same native engine converts fine in plain Node on this runner image
+      # (see the probe step above), but dies inside the packaged runtime with the
+      # worker's catch-all "Unknown LibreOfficeKit exception" (a non-std C++/SEH
+      # crash, see sources/engine/native/worker.cxx). The worker is a child
+      # process, so the only context differences are (A) the engine tree coming
+      # from the pnpm store vs the asar.unpacked unpack and (B) the PATH that
+      # nativeEnvironment passes through (the smoke prepends resources/runtime/bin
+      # to PATH). Run the worker binary directly, three ways:
+      #   P1 store engine + plain env        (control; mirrors the passing CLI probe)
+      #   P2 unpacked engine + plain env     (isolates A: unpack integrity)
+      #   P3 unpacked engine + smoke env     (isolates B: PATH pollution)
+      # then dump the Windows Application log for the worker's crash record
+      # (faulting module names a missing/bad DLL immediately).
+      - name: Diagnose packaged LibreOffice worker (if package failed)
+        if: failure()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $artifacts = Join-Path $env:GITHUB_WORKSPACE 'apps\desktop\.desktop-build\targets\win-x64\unsigned-artifacts'
+          $unpacked = Join-Path $artifacts 'win-unpacked'
+          $unpackedEngine = Join-Path $unpacked 'resources\app.asar.unpacked\dsh\node_modules\@deepseek-ai\libreoffice-kit-win32-x64'
+          $storeEngine = Join-Path (Get-ChildItem (Join-Path $env:GITHUB_WORKSPACE 'node_modules\.pnpm') -Directory -Filter '@deepseek-ai+libreoffice-kit-win32-x64@*' | Sort-Object Name -Descending | Select-Object -First 1).FullName 'node_modules\@deepseek-ai\libreoffice-kit-win32-x64'
+          function TreeStat([string]$dir) {
+            $f = @(Get-ChildItem $dir -Recurse -File -ErrorAction SilentlyContinue)
+            "files=$($f.Count) bytes=$(($f | Measure-Object Length -Sum).Sum)"
+          }
+          "engine store:     $storeEngine :: $(TreeStat $storeEngine)"
+          "engine unpacked:  $unpackedEngine :: $(TreeStat $unpackedEngine)"
+          $probe = Join-Path $env:RUNNER_TEMP 'lo-worker-probe.mjs'
+          $probeScript = @'
+            import { spawn } from 'node:child_process'
+            import { mkdirSync, copyFileSync } from 'node:fs'
+            const [mode, engineDir, workDir, sample, extraBinDir] = process.argv.slice(2)
+            const worker = engineDir + '\\bin\\libreoffice-kit.exe'
+            const program = engineDir + '\\program'
+            const inp = workDir + '\\input.docx'
+            const outp = workDir + '\\out.pdf'
+            const profile = workDir + '\\profile'
+            mkdirSync(profile + '\\user', { recursive: true })
+            copyFileSync(sample, inp)
+            const env = {
+              PATH: process.env.PATH,
+              SystemRoot: process.env.SystemRoot,
+              SYSTEMROOT: process.env.SYSTEMROOT,
+              HOME: profile, USERPROFILE: profile, TMPDIR: profile, TMP: profile, TEMP: profile,
+            }
+            if (mode === 'P3' && extraBinDir) env.PATH = extraBinDir + ';' + env.PATH
+            const child = spawn(worker, [
+              '--program-directory', program, '--input-path', inp, '--output-path', outp,
+              '--profile-directory', profile, '--max-output-bytes', '134217728',
+              '--max-image-resolution', '144', '--format', 'pdf', '--recalculate', 'false',
+            ], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, env })
+            let stdout = '', stderr = ''
+            child.stdout.on('data', (d) => { stdout += d })
+            child.stderr.on('data', (d) => { stderr += d })
+            child.on('close', (code) => {
+              console.log(`[probe:${mode}] exit=${code}`)
+              console.log(`[probe:${mode}] stdout=${stdout.slice(0, 2000)}`)
+              if (stderr) console.log(`[probe:${mode}] stderr=${stderr.slice(-2000)}`)
+            })
+          '@
+          Set-Content -LiteralPath $probe -Value $probeScript -Encoding utf8
+          $sample = Join-Path $env:GITHUB_WORKSPACE 'packages\bundle\web-app\tests\fixtures\document-conversion.docx'
+          $runtimeBin = Join-Path $unpacked 'resources\runtime\bin'
+          foreach ($pair in @(
+            @{ m = 'P1'; e = $storeEngine;    bin = '' },
+            @{ m = 'P2'; e = $unpackedEngine; bin = '' },
+            @{ m = 'P3'; e = $unpackedEngine; bin = $runtimeBin }
+          )) {
+            $work = Join-Path $env:RUNNER_TEMP ("lo-worker-" + $pair.m)
+            New-Item -ItemType Directory -Force $work | Out-Null
+            node $probe $pair.m $pair.e $work $sample $pair.bin 2>&1
+          }
+          "=== Application log: worker crash records (last 30 min) ==="
+          try {
+            Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = (Get-Date).AddMinutes(-30) } -ErrorAction Stop |
+              Where-Object { $_.Message -match 'libreoffice' } |
+              Select-Object -First 5 | ForEach-Object { $_.Message }
+          } catch { "event log read failed: $_" }
+          exit 1
+
+      # Packaging gate: the shell main process must be able to resolve its full static
+      # import graph inside the asar — every bare specifier has to land on a package
+      # present in the asar root node_modules, with a resolvable entry file. 2026-09-24:
+      # upstream 0.1.7 shipped two dependency-declaration bugs (a shell runtime import
+      # declared as devDependency, plus runtime peerDependencies of closure packages
+      # never declared) that made every installed copy crash at startup with
+      # ERR_MODULE_NOT_FOUND — only discoverable on a real machine. This gate catches
+      # that failure class at build time, before anything reaches the CDN.
+      - name: Verify packaged shell closure (asar imports)
+        if: success()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $unpacked = Join-Path $env:GITHUB_WORKSPACE 'apps\desktop\.desktop-build\targets\win-x64\unsigned-artifacts\win-unpacked'
+          if (-not (Test-Path (Join-Path $unpacked 'resources\app.asar'))) { throw "app.asar not found under $unpacked" }
+          node (Join-Path $env:GITHUB_WORKSPACE 'apps\desktop\scripts\verify-asar-closure.mjs') $unpacked
+
+      - name: Publish update feed to Qiniu
+        shell: pwsh
+        env:
+          QINIU_ACCESS_KEY: ${{ secrets.ACCESS_KEY }}
+          QINIU_SECRET_KEY: ${{ secrets.SECRET_KEY }}
+          QINIU_BUCKET: ${{ secrets.BUCKET_NAME }}
+          QINIU_CDN_HOST: ${{ secrets.CDN_HOST }}
+          # Qiniu answered "incorrect region, please use up-z2.qiniup.com" — the bucket lives in zone z2 (South China).
+          QINIU_ZONE: z2
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Tolerate an accidental scheme prefix / trailing slash in the CDN_HOST secret.
+          $cdn = $env:QINIU_CDN_HOST.Trim()
+          while ($cdn -match '^[a-zA-Z][a-zA-Z0-9+.-]*://') { $cdn = ($cdn -replace '^[a-zA-Z][a-zA-Z0-9+.-]*://', '').Trim() }
+          $env:QINIU_CDN_HOST = $cdn.TrimEnd('/').Trim()
+          $work = Join-Path $env:RUNNER_TEMP 'qiniu-publisher'
+          New-Item -ItemType Directory -Force $work | Out-Null
+          Set-Location $work
+          npm install --no-audit --no-fund qiniu@7.15.2
+          node (Join-Path $env:GITHUB_WORKSPACE 'apps\desktop\scripts\publish-qiniu.mjs') `
+            (Join-Path $env:GITHUB_WORKSPACE 'apps\desktop\.desktop-build\targets\win-x64\unsigned-artifacts') `
+            $work
+
+      - name: Show artifacts
+        shell: pwsh
+        run: |
+          Get-ChildItem -Recurse 'apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts' |
+            Sort-Object Length -Descending |
+            Format-Table Name, Length -AutoSize | Out-String -Width 4096
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deepseek-harness-windows-x64-unsigned
+          path: apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts/**/*
+          if-no-files-found: error
+          retention-days: 30
